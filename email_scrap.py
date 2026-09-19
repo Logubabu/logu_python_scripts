@@ -3,24 +3,32 @@ import email
 import re
 import os
 import html
+import base64
+import pandas as pd
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import pandas as pd
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-EMAIL_ADDRESS = "your_email@gmail.com"
-EMAIL_PASSWORD = "your_app_password"
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
 
-# Gmail
-IMAP_SERVER = "imap.gmail.com"
-IMAP_PORT = 993
+# IMAP Server configuration
+IMAP_SERVER = os.environ.get("IMAP_SERVER", "imap.gmail.com")
+IMAP_PORT = int(os.environ.get("IMAP_PORT", 993))
+
+OUTPUT_DIR = "output"
+EXCEL_FILE = os.path.join(OUTPUT_DIR, "jobs.xlsx")
+U_EXCEL_FILE = os.path.join(OUTPUT_DIR, "unique_jobs.xlsx")
+CSV_FILE = os.path.join(OUTPUT_DIR, "jobs.csv")
 
 # For Outlook use:
 # IMAP_SERVER = "outlook.office365.com"
@@ -91,31 +99,20 @@ JOB_SOURCES = {
 # ============================================================
 
 def connect_email():
+    email_addr = EMAIL_ADDRESS or os.environ.get("EMAIL_ADDRESS")
+    email_pass = os.environ.get("EMAIL_PASSWORD")
 
-    print("Connecting to email...")
+    if not email_addr:
+        email_addr = input("Enter your email address: ").strip()
+    if not email_pass:
+        import getpass
+        email_pass = getpass.getpass("Enter your email app password: ").strip()
 
-    mail = imaplib.IMAP4_SSL(
-        IMAP_SERVER,
-        IMAP_PORT
-    )
-
-    try:
-
-        mail.login(
-            EMAIL_ADDRESS,
-            EMAIL_PASSWORD
-        )
-
-        print("Login successful.")
-
-        return mail
-
-    except imaplib.IMAP4.error as error:
-
-        print("Login failed.")
-        print(error)
-
-        raise
+    print(f"Connecting to IMAP server ({IMAP_SERVER}:{IMAP_PORT})...")
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    mail.login(email_addr, email_pass)
+    print("IMAP login successful.")
+    return mail
 
 
 # ============================================================
@@ -822,6 +819,64 @@ def process_email(raw_email):
         message.get("From", "")
     )
 
+def extract_jobs_from_html(html_body, subject, sender, date):
+    if not html_body:
+        return []
+
+    soup = BeautifulSoup(html_body, "html.parser")
+    jobs = []
+
+    # Find anchor links containing job URLs or job title-like text
+    anchors = soup.find_all("a", href=True)
+
+    for a in anchors:
+        link = a["href"].strip()
+        text = a.get_text(separator=" ", strip=True)
+
+        # Check if URL or link text indicates a job listing
+        link_lower = link.lower()
+        if any(term in link_lower for term in ["/job/", "/jobs/", "/apply", "/career/", "jobid=", "clk"]) or \
+           any(domain in link_lower for domain in JOB_SOURCES.keys()):
+
+            # Extract surrounding context container (table row, list item, or div)
+            parent = a.find_parent(["tr", "li", "div", "article", "td"])
+            context = parent.get_text(separator=" ", strip=True) if parent else text
+
+            company = extract_company(subject, sender, context)
+            title = extract_job_title(text if len(text) > 5 else subject, context)
+            exp = extract_experience(context)
+            sal = extract_salary(context)
+            src = detect_source([link], sender, context)
+            norm_link = normalize_url(link)
+
+            if title and norm_link:
+                jobs.append({
+                    "company_name": company,
+                    "job_title": title,
+                    "date": date,
+                    "experience": exp,
+                    "salary_range": sal,
+                    "apply_link": norm_link,
+                    "source": src
+                })
+
+    return jobs
+
+
+def process_email(raw_email):
+
+    message = email.message_from_bytes(
+        raw_email
+    )
+
+    subject = decode_text(
+        message.get("Subject", "")
+    )
+
+    sender = decode_text(
+        message.get("From", "")
+    )
+
     date = get_email_date(
         message.get("Date", "")
     )
@@ -835,13 +890,24 @@ def process_email(raw_email):
         sender,
         body
     ):
-        return None
+        return []
 
+    # Try extracting multiple jobs if present in HTML digest
+    extracted_jobs = extract_jobs_from_html(html_body, subject, sender, date)
+
+    if extracted_jobs:
+        return [j for j in extracted_jobs if j.get("apply_link")]
+
+    # Fallback for single job email
     urls = extract_urls(
         html_body
         + "\n"
         + body
     )
+
+    apply_link = find_apply_link(urls)
+    if not apply_link:
+        return []
 
     source = detect_source(
         urls,
@@ -850,7 +916,6 @@ def process_email(raw_email):
     )
 
     job = {
-
         "company_name":
             extract_company(
                 subject,
@@ -878,15 +943,13 @@ def process_email(raw_email):
             ),
 
         "apply_link":
-            find_apply_link(
-                urls
-            ),
+            apply_link,
 
         "source":
             source,
     }
 
-    return job
+    return [job]
 
 
 # ============================================================
@@ -899,17 +962,18 @@ def remove_duplicates(jobs):
 
     for job in jobs:
 
-        key = duplicate_key(
-            job
-        )
+        link = normalize_url(job.get("apply_link", "")).lower()
 
-        if key not in unique:
+        if not link:
+            continue
 
-            unique[key] = job
+        if link not in unique:
+
+            unique[link] = job
 
         else:
 
-            existing = unique[key]
+            existing = unique[link]
 
             # Fill missing fields
             # from duplicate emails.
@@ -920,13 +984,12 @@ def remove_duplicates(jobs):
                 "date",
                 "experience",
                 "salary_range",
-                "apply_link",
                 "source",
             ]:
 
                 if (
-                    not existing[field]
-                    and job[field]
+                    not existing.get(field)
+                    and job.get(field)
                 ):
 
                     existing[field] = (
@@ -968,16 +1031,24 @@ def export_jobs(jobs):
 
         df = df.drop_duplicates()
 
-    df.to_excel(
-        EXCEL_FILE,
-        index=False
-    )
+    try:
+        df.to_excel(
+            EXCEL_FILE,
+            index=False
+        )
+        print(f"Excel file: {EXCEL_FILE}")
+    except Exception as e:
+        print(f"Could not save Excel file ({e}).")
 
-    df.to_csv(
-        CSV_FILE,
-        index=False,
-        encoding="utf-8-sig"
-    )
+    try:
+        df.to_csv(
+            CSV_FILE,
+            index=False,
+            encoding="utf-8-sig"
+        )
+        print(f"CSV file:   {CSV_FILE}")
+    except Exception as e:
+        print(f"Could not save CSV file ({e}).")
 
     print("\n================================")
     print("JOB EXTRACTION COMPLETED")
@@ -985,14 +1056,6 @@ def export_jobs(jobs):
 
     print(
         f"Total unique jobs: {len(df)}"
-    )
-
-    print(
-        f"Excel file: {EXCEL_FILE}"
-    )
-
-    print(
-        f"CSV file:   {CSV_FILE}"
     )
 
 
@@ -1016,94 +1079,43 @@ def main():
 
     mail = connect_email()
 
-    # Select all mail instead of only inbox.
-    status, _ = mail.select(
-        '"[Gmail]/All Mail"'
-    )
-
-    if status != "OK":
-
-        # Fallback for other providers
-
-        status, _ = mail.select(
-            "INBOX"
-        )
-
-    print(
-        "Reading emails..."
-    )
-
-    status, data = mail.search(
-        None,
-        "ALL"
-    )
-
-    if status != "OK":
-
-        print(
-            "Unable to read emails."
-        )
-
-        mail.logout()
-
-        return
-
-    email_ids = data[0].split()
-
-    print(
-        f"Total emails found: "
-        f"{len(email_ids)}"
-    )
+    print("Reading emails...")
 
     jobs = []
 
-    for index, email_id in enumerate(
-        email_ids,
-        start=1
-    ):
+    mail.select("INBOX")
+    status, data = mail.search(None, "ALL")
 
-        try:
+    if status == "OK" and data[0]:
+        email_ids = data[0].split()
+        print(f"Total emails found: {len(email_ids)}")
 
-            status, message_data = (
-                mail.fetch(
-                    email_id,
-                    "(RFC822)"
-                )
-            )
+        for index, email_id in enumerate(email_ids, start=1):
+            try:
+                res, msg_data = mail.fetch(email_id, "(BODY.PEEK[])")
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        raw_email = response_part[1]
+                        extracted_jobs = process_email(raw_email)
+                        if extracted_jobs:
+                            for job in extracted_jobs:
+                                jobs.append(job)
+                                print(
+                                    f"[{len(jobs)}] "
+                                    f"{job['company_name']} | "
+                                    f"{job['job_title']}"
+                                )
+                # Mark email as unread after reading
+                mail.store(email_id, "-FLAGS", "\\Seen")
+            except Exception as error:
+                print(f"Error processing email {index}: {error}")
+    else:
+        print("No emails found in INBOX.")
 
-            if status != "OK":
-                continue
-
-            for response in message_data:
-
-                if not isinstance(
-                    response,
-                    tuple
-                ):
-                    continue
-
-                raw_email = response[1]
-
-                job = process_email(
-                    raw_email
-                )
-
-                if job:
-
-                    jobs.append(job)
-
-                    print(
-                        f"[{len(jobs)}] "
-                        f"{job['company_name']} | "
-                        f"{job['job_title']}"
-                    )
-
-        except Exception as error:
-
-            print(
-                f"Error processing email "
-                f"{index}: {error}"
-            )
+    try:
+        mail.logout()
+    except Exception:
+        pass
 
     print(
         f"\nJob emails found: {len(jobs)}"
@@ -1121,8 +1133,25 @@ def main():
         jobs
     )
 
-    mail.logout()
 
+def read_output_job():
+    try:
+        df = pd.read_excel(EXCEL_FILE)
+        data = df.to_dict(orient="records")
+        links_list = []
+        final_job = []
+        for job in data:
+            if job["apply_link"] not in links_list:
+                links_list.append(job["apply_link"])
+                final_job.append(job)
+        f_df = pd.DataFrame(final_job)
+        f_df.to_excel(U_EXCEL_FILE,
+            index=False
+        )
+    except Exception as e:
+        print(f"Could not read output job list ({e}).")
+        return []
 
 if __name__ == "__main__":
-    main()
+    # main()
+    read_output_job()
